@@ -1,5 +1,6 @@
 package test
 
+import com.alibaba.fastjson.JSON
 import kafka.common.TopicAndPartition
 import kafka.message.MessageAndMetadata
 import kafka.serializer.StringDecoder
@@ -8,15 +9,23 @@ import org.apache.spark.streaming.kafka.{HasOffsetRanges, KafkaCluster, KafkaUti
 import scalikejdbc.{DB, SQL}
 import scalikejdbc.config.DBs
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.streaming.dstream.InputDStream
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+import util.{RequirementAnalyze, TimeUtils}
 /**
   * 将偏移量保存到MySQL中
   */
 object SparkStreamingOffsetMysql {
   def main(args: Array[String]): Unit = {
-    val conf = new SparkConf().setAppName("ssom").setMaster("local[2]")
-    val ssc = new StreamingContext(conf,Seconds(3))
+
+    val spark = SparkSession
+      .builder()
+      .appName("ssom")
+      .master("local[2]")
+      .getOrCreate()
+    val ssc = new StreamingContext(spark.sparkContext,Seconds(3))
+    ssc.checkpoint("D:\\abc\\APP")
     //一系列基本的配置
     val groupid = "gp1923"
     val brokerList = "hadoop001:9092,hadoop002:9092,hadoop003:9092"
@@ -97,13 +106,69 @@ object SparkStreamingOffsetMysql {
         StringDecoder,StringDecoder,
         (String,String)](ssc,kafkas,checckOffset,messageHandler)
     }
+
+    // 获取province数据并广播
+    val provinceInfo = spark.sparkContext
+      .textFile("D:\\abc\\province.txt")
+      .collect().map(t => {
+      val arr = t.split(" ")
+      (arr(0), arr(1))
+    }).toMap
+    val provinceInfoBroadcast = spark.sparkContext.broadcast(provinceInfo)
     //开始处理数据流，跟咱们之前的ZK那一块一样了
     kafkaStream.foreachRDD(kafkaRDD=>{
       //首先将获取的数据转换 获取offset  后面更新的时候使用
       val offsetRanges = kafkaRDD.asInstanceOf[HasOffsetRanges].offsetRanges
-      val lines = kafkaRDD.map(_._2)
-      lines.foreach(println)
 
+      val baseData = kafkaRDD.map(t=>JSON.parseObject(t._2)) //获取实际的数据
+          .filter(_.getString("serviceName").equalsIgnoreCase("reChargeNotifyReq"))
+          .map(jsobj=>{
+             val rechargeRes = jsobj.getString("bussinessRst") // 充值结果
+             val fee: Double = if (rechargeRes.equals("0000")) // 判断是否充值成功
+              jsobj.getDouble("chargefee") else 0.0 // 充值金额
+             val feeCount = if (!fee.equals(0.0)) 1 else 0 // 获取到充值成功数,金额不等于0
+             val starttime = jsobj.getString("requestId") // 开始充值时间
+             val recivcetime = jsobj.getString("receiveNotifyTime") // 结束充值时间
+             val pcode = jsobj.getString("provinceCode") // 获得省份编号
+             val province = provinceInfoBroadcast.value.get(pcode).toString // 通过省份编号进行取值
+            // 充值成功数
+            val isSucc = if (rechargeRes.equals("0000")) 1 else 0
+            // 充值时长
+            val costtime = if (rechargeRes.equals("0000")) TimeUtils.costtime(starttime, recivcetime) else 0
+            (starttime.substring(0, 8), // 年月日
+              starttime.substring(0, 10), // 年月日时
+              List[Double](1, fee, isSucc, costtime.toDouble, feeCount), // (数字1用于统计充值订单量，充值金额，充值成功数，充值时长，充值成功数且金额不等于0)
+              province, // 省份
+              starttime.substring(0, 12), // 年月日时分
+              (starttime.substring(0, 10), province) // (年月日时，省份)
+            )
+          }).cache()
+      //需求一 业务概括
+      //1)统计全网的充值订单量, 充值金额, 充值成功数，充值平均时长
+      val result1 = baseData.map(t => (t._1, t._3)).reduceByKey((list1, list2) => {
+        //拉链操作:List(1,2,3) List(2,3,4) =>List((1,2),(2,3),(3,4))
+        (list1 zip list2).map(t => t._1 + t._2)
+      })
+      RequirementAnalyze.requirement01(result1)
+      //需求二 业务质量
+      // 需求二：业务质量
+      val result2 = baseData.map(t => (t._6, t._3)).reduceByKey((list1, list2) => {
+        list1.zip(list2).map(t => t._1 + t._2)
+      })
+      RequirementAnalyze.requirement02(result2)
+
+      // 需求三：充值订单省份 TOP10
+      val result3 = baseData.map(t => (t._4, t._3)).reduceByKey((list1, list2) => {
+        list1.zip(list2).map(t => t._1 + t._2)
+      })
+      RequirementAnalyze.requirement03(result3)
+
+      // 需求四：实时充值情况分布
+      // 要将两个list拉倒一起去，因为每次处理的结果要合并
+      val result4 = baseData.map(t => (t._5, t._3)).reduceByKey((list1, list2) => {
+        list1.zip(list2).map(t => t._1 + t._2)
+      })
+      RequirementAnalyze.requirement04(result4)
       //更新偏移量
       DB.localTx{
         implicit session =>

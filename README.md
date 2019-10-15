@@ -1,0 +1,3 @@
+# gp1923_kafka_sparkstream
+sparkstreaming直连方式kafka 
+使用MySQL维护offset值

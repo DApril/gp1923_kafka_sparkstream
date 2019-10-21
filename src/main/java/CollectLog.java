@@ -34,7 +34,7 @@ public class CollectLog {
                 Thread.sleep(1000);
                 producer.send(
                         new ProducerRecord<String, String>(
-                                "ts", line));
+                                "spark_kafka", line));
             }
             bf.close();
             producer.close();
